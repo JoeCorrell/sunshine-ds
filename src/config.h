@@ -123,6 +123,22 @@ namespace config {
     std::string output_name;  ///< Display output name selected in configuration.
 
     /**
+     * @brief Where a client's second display comes from.
+     *
+     * Empty disables the feature outright, and is the default: a host does not
+     * start handing out second displays because somebody upgraded.
+     *
+     * "virtual" asks the indirect display driver for a monitor sized to the
+     * client's second panel, which is the case this was built for — the panel is
+     * an odd size that no real monitor matches, and it should not exist when
+     * nobody is streaming to it.
+     *
+     * Anything else is taken as the output name of a real monitor to capture,
+     * for a machine that genuinely has a spare one.
+     */
+    std::string dual_display_source;
+
+    /**
      * @brief Display-device integration settings.
      */
     struct dd_t {

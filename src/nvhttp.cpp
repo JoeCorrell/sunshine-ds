@@ -22,6 +22,7 @@
 // local includes
 #include "config.h"
 #include "display_device.h"
+#include "dual_display.h"
 #include "file_handler.h"
 #include "globals.h"
 #include "httpcommon.h"
@@ -916,6 +917,21 @@ namespace nvhttp {
 
     const uint32_t codec_mode_flags = get_codec_mode_flags();
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
+
+    /*
+     * How many video streams this host will serve at once.
+     *
+     * An extension; see `docs/dual_display_protocol.md`. Absent means one, which
+     * is what every stock host means, so a client that does not understand this
+     * ignores it exactly as it ignores any other unfamiliar element.
+     *
+     * Always emitted rather than only when greater than one, because a client
+     * that finds the element and reads 1 has learned something a client that
+     * finds nothing has not: that this host implements the extension and is
+     * currently unable to serve a second display. That distinction is worth a
+     * different message to the user.
+     */
+    tree.put("root.MaxVideoStreams", dual_display::supported() ? 2 : 1);
 
     if (!config::nvhttp.external_ip.empty()) {
       tree.put("root.ExternalIP", config::nvhttp.external_ip);

@@ -20,6 +20,17 @@ namespace stream {
   constexpr auto CONTROL_PORT = 10;  ///< GameStream base-port offset used for the control channel.
   constexpr auto AUDIO_STREAM_PORT = 11;  ///< GameStream base-port offset used for the audio UDP stream.
 
+  /**
+   * @brief Base-port offset for the second display's video UDP stream.
+   *
+   * 12 because offsets 0, 9, 10, 11 and 21 are taken and 12 sits next to audio,
+   * which keeps the whole AV group contiguous for anyone reading a firewall rule.
+   *
+   * This is an extension: no GameStream client asks for it, and none is offered
+   * it unless it says it wants one. See `docs/dual_display_protocol.md`.
+   */
+  constexpr auto VIDEO_STREAM_2_PORT = 12;
+
   struct session_t;
 
   /**
@@ -28,6 +39,21 @@ namespace stream {
   struct config_t {
     audio::config_t audio;  ///< Audio capture configuration for the stream.
     video::config_t monitor;  ///< Video capture and encoder configuration for the selected monitor.
+
+    /**
+     * @brief The second display, when the client asked for one.
+     *
+     * Empty for every client that did not, which is all of them until one is
+     * built against `docs/dual_display_protocol.md`. Optional rather than a
+     * flag beside a always-present struct, so there is no way to read a second
+     * monitor's configuration without having established that there is one.
+     *
+     * Budgeted separately from [monitor] rather than sharing its bitrate. The
+     * second panel usually holds a desktop that is static for minutes at a
+     * time, and splitting one budget by area would starve the game to reserve
+     * bandwidth for a screen that is not changing.
+     */
+    std::optional<video::config_t> monitor2;
 
     int packetsize;  ///< Maximum payload size for network packets.
     int minRequiredFecPackets;  ///< Minimum recovery packets required before FEC is emitted.

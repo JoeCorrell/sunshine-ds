@@ -23,6 +23,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "dual_display.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -1019,11 +1020,58 @@ namespace rtsp_stream {
     auto end = std::find(begin, std::end(target), '/');
     std::string_view type {begin, (size_t) std::distance(begin, end)};
 
+    /*
+     * The stream index, which the protocol has always carried and this server
+     * has always thrown away.
+     *
+     * Identifiers are `streamid=video/0/0`, and the first number is the index of
+     * the video stream being set up — the same index the SDP's `x-nv-video[N]`
+     * slots use. Every client sends 0, so discarding it was harmless until now.
+     *
+     * Absent or unparseable means 0, which keeps `streamid=video` (sent by
+     * clients older than GameStream 5) working.
+     */
+    int stream_index = 0;
+    if (end != std::end(target)) {
+      auto index_begin = end + 1;
+      auto index_end = std::find(index_begin, std::end(target), '/');
+      std::string_view index_str {index_begin, (size_t) std::distance(index_begin, index_end)};
+      if (!index_str.empty() && std::all_of(std::begin(index_str), std::end(index_str), ::isdigit)) {
+        stream_index = (int) util::from_view(index_str);
+      }
+    }
+
     std::uint16_t port;
     if (type == "audio"sv) {
       port = net::map_port(stream::AUDIO_STREAM_PORT);
     } else if (type == "video"sv) {
-      port = net::map_port(stream::VIDEO_STREAM_PORT);
+      /*
+       * A second video stream gets a port of its own, and that is what tells a
+       * client its request was understood.
+       *
+       * A server that has not implemented this replies to `video/1/0` with the
+       * same port it gave `video/0/0`, and the client is required to treat that
+       * collision as "not supported" and tear the second stream down — because
+       * two decoders fed one interleaved bytestream fails as corruption rather
+       * than as a missing feature. Answering with a distinct port is therefore
+       * load-bearing, not cosmetic.
+       *
+       * Refused when this host cannot serve a second display at all, so a client
+       * is never handed a port that nothing will ever write to. The check is
+       * host-global because `SETUP` arrives before `ANNOUNCE` — at this point the
+       * server has not seen the client's SDP and cannot know what this session
+       * wants, only what it is capable of.
+       */
+      if (stream_index == 1) {
+        if (!dual_display::supported()) {
+          BOOST_LOG(warning) << "SETUP for video/1 but no second display is available"sv;
+          cmd_not_found(sock, session, std::move(req));
+          return;
+        }
+        port = net::map_port(stream::VIDEO_STREAM_2_PORT);
+      } else {
+        port = net::map_port(stream::VIDEO_STREAM_PORT);
+      }
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
     } else {
@@ -1137,6 +1185,21 @@ namespace rtsp_stream {
     args.try_emplace("x-ss-video[0].intraRefresh"sv, "0"sv);
     args.try_emplace("x-nv-video[0].clientRefreshRateX100"sv, "0"sv);
 
+    /*
+     * Defaults for the second display, so that not asking for one is free.
+     *
+     * `args.at()` throws, and the whole block below is wrapped in one try — so a
+     * missing key here would not merely skip the second display, it would abort
+     * parsing the entire session config and drop the client. Every one of these
+     * has to default to "no second display" for every client that has never
+     * heard of one, which is all of them.
+     */
+    args.try_emplace("x-ml-video[1].enable"sv, "0"sv);
+    args.try_emplace("x-nv-video[1].clientViewportWd"sv, "0"sv);
+    args.try_emplace("x-nv-video[1].clientViewportHt"sv, "0"sv);
+    args.try_emplace("x-nv-video[1].maxFPS"sv, "0"sv);
+    args.try_emplace("x-nv-video[1].initialBitrateKbps"sv, "0"sv);
+
     stream::config_t config;
 
     std::int64_t configuredBitrateKbps;
@@ -1193,6 +1256,47 @@ namespace rtsp_stream {
           config.monitor.framerateX100 = 0;
         }
       }
+      /*
+       * The second display, when the client asked for one.
+       *
+       * `x-ml-video[1].enable` is the request, and it is required to be present
+       * and set rather than inferred from the `x-nv-video[1].*` slots beside it.
+       * Those slots have carried `transferProtocol` and `rateControlMode`
+       * boilerplate from every client for years, so their presence says nothing
+       * about intent — a host that read them as a request would start a second
+       * encoder for clients that have never heard of one.
+       *
+       * Everything else is read only once the request is established, and read
+       * defensively: a client that asks for a second display without saying how
+       * big it is gets no second display rather than a zero-sized encoder.
+       */
+      if (util::from_view(args.at("x-ml-video[1].enable"sv)) != 0) {
+        if (!dual_display::supported()) {
+          BOOST_LOG(info) << "Client requested a second display, but none is available"sv;
+        } else {
+          video::config_t monitor2 = config.monitor;
+          monitor2.width = (int) util::from_view(args.at("x-nv-video[1].clientViewportWd"sv));
+          monitor2.height = (int) util::from_view(args.at("x-nv-video[1].clientViewportHt"sv));
+          monitor2.framerate = (int) util::from_view(args.at("x-nv-video[1].maxFPS"sv));
+          monitor2.bitrate = (int) util::from_view(args.at("x-nv-video[1].initialBitrateKbps"sv));
+
+          // Copied from the first monitor and then cleared, rather than left:
+          // framerateX100 describes the *client's* panel refresh for stream 0 and
+          // means nothing here, and carrying it over would set the second
+          // encoder's cadence from the first panel's display mode.
+          monitor2.framerateX100 = 0;
+
+          if (monitor2.width <= 0 || monitor2.height <= 0 || monitor2.framerate <= 0) {
+            BOOST_LOG(warning) << "Client requested a second display without a usable mode"sv;
+          } else {
+            BOOST_LOG(info) << "Second display requested: "sv << monitor2.width << 'x'
+                            << monitor2.height << '@' << monitor2.framerate
+                            << " at "sv << monitor2.bitrate << " Kbps"sv;
+            config.monitor2 = monitor2;
+          }
+        }
+      }
+
       config.monitor.bitrate = (int) util::from_view(args.at("x-nv-vqos[0].bw.maximumBitrateKbps"sv));
       config.monitor.slicesPerFrame = (int) util::from_view(args.at("x-nv-video[0].videoEncoderSlicesPerFrame"sv));
       config.monitor.numRefFrames = (int) util::from_view(args.at("x-nv-video[0].maxNumReferenceFrames"sv));
