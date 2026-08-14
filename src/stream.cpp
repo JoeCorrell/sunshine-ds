@@ -456,12 +456,23 @@ namespace stream {
 
     std::jthread recv_thread;  ///< Thread that receives incoming control-channel messages.
     std::jthread video_thread;  ///< Thread that sends encoded video packets.
+    std::jthread video_thread2;  ///< Thread that sends the second display's video packets.
     std::jthread audio_thread;  ///< Thread that sends encoded audio packets.
     std::jthread control_thread;  ///< Thread that runs the ENet control server.
 
     asio::io_context io_context;  ///< Asio context used by the UDP broadcast sockets.
 
     udp::socket video_sock {io_context};  ///< UDP socket bound for video packet transmission.
+    /**
+     * UDP socket for the second display's video stream.
+     *
+     * Bound unconditionally alongside the first, even though most sessions never
+     * use it. Binding on demand would mean opening a port while a session is
+     * already negotiating, and the port has to be answerable at RTSP SETUP time
+     * — which happens before the host knows whether this particular client wants
+     * a second display.
+     */
+    udp::socket video_sock2 {io_context};
     udp::socket audio_sock {io_context};  ///< UDP socket bound for audio packet transmission.
 
     control_server_t control_server;  ///< ENet server for GameStream control packets.
@@ -486,7 +497,16 @@ namespace stream {
 
     boost::asio::ip::address localAddress;  ///< Local address.
 
-    struct {
+    /**
+     * @brief Per-stream state for one video stream.
+     *
+     * Named rather than anonymous so a session can hold two of them. Everything
+     * in here is genuinely per-stream: the sequence number, the peer endpoint,
+     * the cipher and its IV counter, and the IDR/invalidation events all belong
+     * to one encoder's packet flow, and sharing any of them between two streams
+     * would interleave two pictures into one sequence.
+     */
+    struct video_stream_t {
       std::string ping_payload;
 
       int lowseq;
@@ -499,7 +519,20 @@ namespace stream {
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
 
       std::unique_ptr<platf::deinit_t> qos;
-    } video;  ///< Video worker thread state for the active stream.
+    };
+
+    video_stream_t video;  ///< Video worker thread state for the active stream.
+
+    /**
+     * The second display's stream state.
+     *
+     * Left default-constructed for every session that does not use one, which is
+     * all of them against a client that has not asked. Its `peer` stays unset
+     * until the client pings the second video port, and the sender thread skips
+     * a stream whose peer is unknown — so an unused second stream costs one
+     * struct and no traffic.
+     */
+    video_stream_t video2;
 
     struct {
       crypto::cipher::cbc_t cipher;
@@ -1465,9 +1498,11 @@ namespace stream {
    *
    * @param sock Socket used to read or write the protocol message.
    */
-  void videoBroadcastThread(udp::socket &sock) {
+  void videoBroadcastThread(udp::socket &sock, std::string_view mail_id, session_t::video_stream_t session_t::*state) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
-    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    // Whichever display this thread serves. The two queues are drained
+    // independently so a slow desktop frame never sits in front of a game frame.
+    auto packets = mail::man->queue<video::packet_t>(mail_id);
     auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread
@@ -1498,7 +1533,7 @@ namespace stream {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
-      auto lowseq = session->video.lowseq;
+      auto lowseq = (session->*state).lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
       std::vector<uint8_t> payload_with_replacements;
@@ -1645,10 +1680,10 @@ namespace stream {
 
           frame_fec_latency_logger.first_point_now();
           // If video encryption is enabled, we allocate space for the encryption header before each shard
-          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, (session->*state).cipher ? sizeof(video_packet_enc_prefix_t) : 0);
           frame_fec_latency_logger.second_point_now_and_log();
 
-          auto peer_address = session->video.peer.address();
+          auto peer_address = (session->*state).peer.address();
           auto batch_info = platf::batched_send_info_t {
             shards.headers.begin(),
             shards.prefixsize,
@@ -1658,7 +1693,7 @@ namespace stream {
             0,
             (uintptr_t) sock.native_handle(),
             peer_address,
-            session->video.peer.port(),
+            (session->*state).peer.port(),
             session->localAddress,
           };
 
@@ -1691,7 +1726,7 @@ namespace stream {
             inspect->packet.frameIndex = (uint32_t) packet->frame_index();
 
             // Encrypt this shard if video encryption is enabled
-            if (session->video.cipher) {
+            if ((session->*state).cipher) {
               // We use the deterministic IV construction algorithm specified in NIST SP 800-38D
               // Section 8.2.1. The sequence number is our "invocation" field and the 'V' in the
               // high bytes is the "fixed" field. Because each client provides their own unique
@@ -1700,15 +1735,15 @@ namespace stream {
               //
               // The IV counter is 64 bits long which allows for 2^64 encrypted video packets
               // to be sent to each client before the IV repeats.
-              std::copy_n((uint8_t *) &session->video.gcm_iv_counter, sizeof(session->video.gcm_iv_counter), std::begin(iv));
+              std::copy_n((uint8_t *) &(session->*state).gcm_iv_counter, sizeof((session->*state).gcm_iv_counter), std::begin(iv));
               iv[11] = 'V';  // Video stream
-              session->video.gcm_iv_counter++;
+              (session->*state).gcm_iv_counter++;
 
               // Encrypt the target buffer in place
               auto *prefix = (video_packet_enc_prefix_t *) shards.prefix(x);
               prefix->frameNumber = (std::uint32_t) packet->frame_index();
               std::copy(std::begin(iv), std::end(iv), prefix->iv);
-              session->video.cipher->encrypt(std::string_view {(char *) inspect, (size_t) blocksize}, prefix->tag, (uint8_t *) inspect, &iv);
+              (session->*state).cipher->encrypt(std::string_view {(char *) inspect, (size_t) blocksize}, prefix->tag, (uint8_t *) inspect, &iv);
             }
 
             if (x - next_shard_to_send + 1 >= send_batch_size || x + 1 == shards.size()) {
@@ -1745,7 +1780,7 @@ namespace stream {
                     shards.blocksize,
                     (uintptr_t) sock.native_handle(),
                     peer_address,
-                    session->video.peer.port(),
+                    (session->*state).peer.port(),
                     session->localAddress,
                   };
 
@@ -1777,7 +1812,7 @@ namespace stream {
           lowseq += shards.size();
         });
 
-        session->video.lowseq = lowseq;
+        (session->*state).lowseq = lowseq;
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
@@ -1942,6 +1977,31 @@ namespace stream {
       return -1;
     }
 
+    /*
+     * The second display's socket.
+     *
+     * A failure here is logged and tolerated rather than fatal, unlike the first
+     * video socket above. The port may be taken by something else on a machine
+     * that has never used this feature, and refusing to stream at all because an
+     * optional second display could not be bound would break ordinary sessions
+     * for a capability the client probably never asked for. Left closed, the
+     * sender thread simply never sends, and RTSP still answers `video/1/0`
+     * because `dual_display::supported()` is about the display rather than the
+     * socket — a client that gets that far sees a stream that carries no frames
+     * and drops to one display, which is the same path a declining host takes.
+     */
+    auto video_port2 = net::map_port(VIDEO_STREAM_2_PORT);
+    ctx.video_sock2.open(protocol, ec);
+    if (ec) {
+      BOOST_LOG(warning) << "Couldn't open socket for the second display: "sv << ec.message();
+    } else {
+      ctx.video_sock2.bind(udp::endpoint(bind_addr, video_port2), ec);
+      if (ec) {
+        BOOST_LOG(warning) << "Couldn't bind the second display to port ["sv << video_port2
+                           << "]: "sv << ec.message();
+      }
+    }
+
     ctx.audio_sock.open(protocol, ec);
     if (ec) {
       BOOST_LOG(fatal) << "Couldn't open socket for Audio server: "sv << ec.message();
@@ -1958,7 +2018,26 @@ namespace stream {
 
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
-    ctx.video_thread = std::jthread {videoBroadcastThread, std::ref(ctx.video_sock)};
+    ctx.video_thread = std::jthread {
+      videoBroadcastThread,
+      std::ref(ctx.video_sock),
+      mail::video_packets,
+      &session_t::video,
+    };
+    /*
+     * The second display's sender, started whether or not anything will use it.
+     *
+     * It costs a thread blocked on an empty queue. Starting it on demand would
+     * mean spinning one up mid-session, at the moment the first frame is already
+     * being encoded, and the port it sends from has to have been answerable at
+     * RTSP SETUP long before that.
+     */
+    ctx.video_thread2 = std::jthread {
+      videoBroadcastThread,
+      std::ref(ctx.video_sock2),
+      mail::video_packets2,
+      &session_t::video2,
+    };
     ctx.audio_thread = std::jthread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::jthread {controlBroadcastThread, &ctx.control_server};
 

@@ -27,8 +27,20 @@ execute_process(
 )
 
 if(NOT WIX_INSTALL_RESULT EQUAL 0)
-    message(FATAL_ERROR "Failed to install WiX tools locally.
-     WiX packaging may not work correctly, error: ${WIX_INSTALL_OUTPUT}")
+    # A warning rather than a fatal error, and skipped rather than half-configured.
+    #
+    # This is packaging: it builds an .msi, and failing to fetch the tool that
+    # builds one is not a reason to refuse to build the *program*. As a fatal
+    # error it stopped configuration outright for anyone with dotnet installed
+    # but unable to reach the tool feed -- or, as here, with dotnet present but
+    # USERPROFILE unset in the shell, which makes `dotnet tool install` fail with
+    # "Value cannot be null. (Parameter 'path1')" and nothing to do with WiX.
+    #
+    # Returning leaves CPACK_GENERATOR without WIX, so `cpack` simply does not
+    # offer an installer, and `cmake --build` is unaffected.
+    message(WARNING "Failed to install WiX tools locally; skipping WiX packaging.
+     Sunshine will still build. Error: ${WIX_INSTALL_OUTPUT}")
+    return()
 endif()
 
 # Install WiX UI Extension
