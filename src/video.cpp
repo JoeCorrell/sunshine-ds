@@ -614,6 +614,22 @@ namespace video {
     config_t config;  ///< Stream or encoder configuration captured for the worker.
     int frame_nr;  ///< Next capture-frame number assigned to encoded packets.
     void *channel_data;  ///< Platform-specific channel data forwarded to packet senders.
+
+    /**
+     * @brief Pins this session to one display, by output name.
+     *
+     * Empty for every ordinary session, which then follows the global configured
+     * output and the user's display-switch hotkey exactly as before.
+     *
+     * Set only for a second display. That session must *not* follow the switch
+     * event or the configured output — both of those describe the screen the
+     * game is on, and honouring them here would move the desktop stream onto the
+     * game's display and send the same picture twice.
+     *
+     * Last in the struct so the existing aggregate initialisers, which list nine
+     * members, keep compiling and get an empty override.
+     */
+    std::string output_name_override;
   };
 
   /**
@@ -690,6 +706,30 @@ namespace video {
   // Keep a reference counter to ensure the capture thread only runs when other threads have a reference to the capture thread
   auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);  ///< Capture thread async.
   auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);  ///< Capture thread sync.
+
+  /**
+   * @brief Start the second display's capture thread.
+   */
+  int start_capture_sync2(capture_thread_sync_ctx_t &ctx);
+
+  /**
+   * @brief Stop the second display's capture thread.
+   */
+  void end_capture_sync2(capture_thread_sync_ctx_t &ctx);
+
+  /**
+   * @brief Capture thread for the second display.
+   *
+   * A second instance rather than a second session on the existing one, because
+   * that thread opens *one* display and shares it between every session queued
+   * on it — which is exactly right for several clients watching the same screen
+   * and exactly wrong here, where the whole point is a different screen.
+   *
+   * Reference counted like the first, so it exists only while a session is
+   * actually using a second display and costs nothing for the sessions that are
+   * not.
+   */
+  auto capture_thread_sync2 = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync2, end_capture_sync2);
 
 #ifdef _WIN32
   /**
@@ -2654,7 +2694,27 @@ namespace video {
       synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*ctx)));
     }
 
+    /*
+     * A second display is pinned to one output and follows nothing.
+     *
+     * The configured output name and the display-switch hotkey both describe the
+     * screen the *game* is on. A second-display session that honoured either
+     * would follow the game onto its display and send the same picture down both
+     * streams — so this session resolves its display once, from its own override,
+     * and ignores both.
+     */
+    const auto &pinned_output = synced_session_ctxs.front()->output_name_override;
+
     while (encode_session_ctx_queue.running()) {
+      if (!pinned_output.empty()) {
+        // reset_display() will sleep between retries
+        reset_display(disp, encoder.platform_formats->dev_type, pinned_output, synced_session_ctxs.front()->config);
+        if (disp) {
+          break;
+        }
+        continue;
+      }
+
       // Refresh display names since a display removal might have caused the reinitialization
       refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
 
@@ -2787,9 +2847,17 @@ namespace video {
   /**
    * @brief Run synchronous capture and encode work on the capture thread.
    */
-  void captureThreadSync() {
-    auto ref = capture_thread_sync.ref();
-
+  /**
+   * @brief The capture and encode loop, for one display.
+   *
+   * Takes its context rather than reaching for the singleton, so the same loop
+   * serves the game's display and the second one. Everything below was already
+   * per-context; only the reference was hard-coded.
+   */
+  void captureThreadSyncFor(
+    const std::shared_ptr<safe::shared_t<capture_thread_sync_ctx_t>::element_type> &ref,
+    const char *thread_name
+  ) {
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
 
     auto &ctx = ref->encode_session_ctx_queue;
@@ -2808,12 +2876,21 @@ namespace video {
     });
 
     // Encoding and capture takes place on this thread
-    platf::set_thread_name("video::capture_sync");
+    platf::set_thread_name(thread_name);
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
     std::vector<std::string> display_names;
     int display_p = -1;
     while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p) == encode_e::reinit) {}
+  }
+
+  void captureThreadSync() {
+    captureThreadSyncFor(capture_thread_sync.ref(), "video::capture_sync");
+  }
+
+  /** The same loop, on the second display's own context and its own display. */
+  void captureThreadSync2() {
+    captureThreadSyncFor(capture_thread_sync2.ref(), "video::capture_sync2");
   }
 
   /**
@@ -2942,6 +3019,48 @@ namespace video {
       // Wait for join signal
       join_event.view();
     }
+  }
+
+  void capture_second_display(
+    safe::mail_t mail,
+    config_t config,
+    void *channel_data,
+    const std::string &output_name
+  ) {
+    auto idr_events = mail->event<bool>(mail::idr);
+    idr_events->raise(true);
+
+    /*
+     * Always the synchronous path, never the parallel one.
+     *
+     * `capture_async` drives the shared asynchronous capture thread, which holds
+     * a single display for every session queued on it. That is right for several
+     * clients watching one screen and wrong for this, where the entire point is a
+     * different screen -- routing a second display through it would silently
+     * stream the game's display twice.
+     *
+     * So this pins its own capture thread to its own output, regardless of what
+     * the encoder would have preferred. It costs the parallel encoder's
+     * throughput advantage on a stream that is usually a static desktop.
+     */
+    safe::signal_t join_event;
+    auto ref = capture_thread_sync2.ref();
+    ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
+      &join_event,
+      mail->event<bool>(mail::shutdown),
+      // The second display's own queue. `stream.cpp` runs a sender thread
+      // draining exactly this one.
+      mail::man->queue<packet_t>(mail::video_packets2),
+      std::move(idr_events),
+      mail->event<hdr_info_t>(mail::hdr),
+      mail->event<input::touch_port_t>(mail::touch_port),
+      config,
+      1,
+      channel_data,
+      output_name,
+    });
+
+    join_event.view();
   }
 
   /**
@@ -3637,6 +3756,14 @@ namespace video {
    * @brief Stop capture sync processing.
    */
   void end_capture_sync(capture_thread_sync_ctx_t &ctx) {
+  }
+
+  int start_capture_sync2(capture_thread_sync_ctx_t &ctx) {
+    std::jthread {&captureThreadSync2}.detach();
+    return 0;
+  }
+
+  void end_capture_sync2(capture_thread_sync_ctx_t &ctx) {
   }
 
   /**

@@ -622,6 +622,27 @@ namespace video {
   );
 
   /**
+   * @brief Capture and encode a second display, into the second video queue.
+   *
+   * Runs on a capture thread of its own, pinned to [output_name], and emits to
+   * `mail::video_packets2` where `stream.cpp`'s second sender thread is waiting.
+   *
+   * Blocks for the life of the stream, exactly as [capture] does, so callers run
+   * it on their own thread.
+   *
+   * @param mail Session mail bus.
+   * @param config Video configuration for the second display.
+   * @param channel_data Opaque channel data passed to packets.
+   * @param output_name The display to capture. Must not be empty.
+   */
+  void capture_second_display(
+    safe::mail_t mail,
+    config_t config,
+    void *channel_data,
+    const std::string &output_name
+  );
+
+  /**
    * @brief Validate encoder before it is used.
    *
    * @param encoder Encoder configuration or encoder instance.

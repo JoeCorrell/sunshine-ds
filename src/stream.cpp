@@ -21,6 +21,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "dual_display.h"
 #include "display_device.h"
 #include "globals.h"
 #include "input.h"
@@ -490,10 +491,20 @@ namespace stream {
 
     std::jthread audioThread;  ///< Audio thread.
     std::jthread videoThread;  ///< Video thread.
+    std::jthread videoThread2;  ///< Second display's video thread; unused unless one was negotiated.
 
     std::chrono::steady_clock::time_point pingTimeout;  ///< Deadline for receiving the next client ping.
 
     safe::shared_t<broadcast_ctx_t>::ptr_t broadcast_ref;  ///< Shared broadcast context retained while the session is active.
+
+    /**
+     * The display being streamed as the second video stream.
+     *
+     * Held for the life of the session: destroying it releases whatever was
+     * acquired, so a virtual monitor created for this client disappears when the
+     * client does rather than outliving it on the desktop.
+     */
+    std::unique_ptr<dual_display::lease_t> second_display;
 
     boost::asio::ip::address localAddress;  ///< Local address.
 
@@ -2175,6 +2186,54 @@ namespace stream {
   }
 
   /**
+   * @brief Run the second display's capture and encode thread.
+   *
+   * @param session Active streaming session for the request.
+   *
+   * Deliberately does *not* stop the session when it ends. `videoThread` above
+   * carries a fail guard that tears the whole session down, which is right for
+   * the display the game is on and wrong for this one: losing the desktop screen
+   * must cost the user a screen rather than the game they are playing. This is
+   * the host-side half of the same rule the client follows in
+   * `SecondStreamListenerCallbacks`.
+   */
+  void videoThread2(session_t *session, std::string output_name) {
+    platf::set_thread_name("session::video2");
+
+    auto ref = broadcast.ref();
+
+    /*
+     * Waits for the client to ping the second video port before capturing.
+     *
+     * The peer address is not known until then, and starting the encoder first
+     * would spend a display capture and an encoder session producing frames with
+     * nowhere to send them. A client that negotiated the stream and then never
+     * pings -- because it gave up, or the port is blocked -- simply times out
+     * here and the session continues with one display.
+     */
+    auto error = recv_ping(
+      session,
+      ref,
+      socket_e::video,
+      session->video2.ping_payload,
+      session->video2.peer,
+      config::stream.ping_timeout
+    );
+    if (error < 0) {
+      BOOST_LOG(info) << "Second display: client never connected; continuing with one display"sv;
+      return;
+    }
+
+    BOOST_LOG(info) << "Start capturing the second display ["sv << output_name << ']';
+    video::capture_second_display(
+      session->mail,
+      session->config.monitor2.value(),
+      session,
+      output_name
+    );
+  }
+
+  /**
    * @brief Run the session audio capture and encode thread.
    *
    * @param session Active streaming or pairing session for the request.
@@ -2306,6 +2365,9 @@ namespace stream {
       session.video.peer.address(addr);
       session.video.peer.port(0);
 
+      session.video2.peer.address(addr);
+      session.video2.peer.port(0);
+
       session.audio.peer.address(addr);
       session.audio.peer.port(0);
 
@@ -2313,6 +2375,31 @@ namespace stream {
 
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
+
+      /*
+       * The second display, when the client negotiated one and a display is
+       * available to serve it.
+       *
+       * Both halves are checked here rather than trusted: `monitor2` says the
+       * client asked and the SDP was usable, and `acquire` says this host can
+       * actually provide a display right now. Either can be true without the
+       * other -- the driver can have gone away between /serverinfo and the
+       * launch -- and starting an encoder for a display that is not there would
+       * fail deep inside the capture backend instead of here.
+       */
+      if (session.config.monitor2) {
+        auto lease = dual_display::acquire({
+          session.config.monitor2->width,
+          session.config.monitor2->height,
+          session.config.monitor2->framerate,
+        });
+        if (lease) {
+          session.second_display = std::move(lease);
+          session.videoThread2 = std::jthread {videoThread2, &session, session.second_display->output_name()};
+        } else {
+          BOOST_LOG(info) << "Client asked for a second display, but none could be acquired"sv;
+        }
+      }
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
