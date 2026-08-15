@@ -6,6 +6,7 @@
 #include "dual_display.h"
 
 #include "config.h"
+#include "display_device.h"
 #include "logging.h"
 #include "platform/common.h"
 
@@ -59,22 +60,53 @@ namespace dual_display {
     };
 
     /**
-     * @brief Whether an indirect display driver is installed and usable.
+     * @brief The display the game is being streamed from.
      *
-     * Windows has no API to create a monitor. A virtual display is an IddCx
-     * driver — signed, installed by the user, and outside this program — so all
-     * that can be done here is find one and ask it.
+     * The second display is defined as "not this one", so this is what it is
+     * measured against. Empty means the platform default, which is also what an
+     * empty `output_name` means to the capture backend.
+     */
+    [[nodiscard]] std::string primary_output() {
+      return display_device::map_output_name(config::video.output_name);
+    }
+
+    /**
+     * @brief A display to stream that is not the one carrying the game.
      *
-     * Unimplemented, and reporting false is therefore correct rather than a
-     * placeholder: with no driver bound, `supported()` says no, `/serverinfo`
-     * advertises one video stream, `SETUP` for `video/1/0` is refused, and every
-     * client behaves exactly as it does against stock Sunshine. The feature is
-     * off, not broken.
+     * Windows has no API to *create* a monitor -- a virtual display is an IddCx
+     * driver, signed and installed by the user, outside this program entirely.
+     * What this does instead is find one that is already attached.
      *
-     * @todo Bind to an installed IddCx driver. See `docs/virtual_display.md`.
+     * That is deliberately not the same as "create on demand", and the
+     * difference is worth stating: the monitor has to already exist, which for a
+     * virtual display driver means its monitor is switched on. In exchange it
+     * needs no driver-specific control channel, works with any IddCx driver
+     * rather than one this fork was written against, and needs no elevation --
+     * a driver-specific implementation would need all three.
+     *
+     * Returns empty when there is nothing but the game's own display, which is
+     * the ordinary single-monitor case.
+     */
+    [[nodiscard]] std::string find_spare_output() {
+      const auto primary = primary_output();
+      const auto outputs = platf::display_names(platf::mem_type_e::system);
+
+      for (const auto &output : outputs) {
+        if (output != primary) {
+          return output;
+        }
+      }
+
+      // A single display, or the only other one is the game's. Either way there
+      // is nothing here to give.
+      return {};
+    }
+
+    /**
+     * @brief Whether a second display can be provided without being named.
      */
     [[nodiscard]] bool virtual_display_available() {
-      return false;
+      return !find_spare_output().empty();
     }
 
   }  // namespace
@@ -107,10 +139,15 @@ namespace dual_display {
     const auto &source = config::video.dual_display_source;
 
     if (source == VIRTUAL) {
-      // Unreachable while `virtual_display_available()` reports false; kept so
-      // that binding a driver is a change in one place.
-      BOOST_LOG(warning) << "Virtual display requested but no driver is bound"sv;
-      return nullptr;
+      const auto spare = find_spare_output();
+      if (spare.empty()) {
+        BOOST_LOG(warning) << "No spare display to serve as a second display"sv;
+        return nullptr;
+      }
+
+      BOOST_LOG(info) << "Second display: capturing spare output "sv << spare << " at "sv
+                      << request.width << 'x' << request.height << '@' << request.framerate;
+      return std::make_unique<physical_lease_t>(spare, request);
     }
 
     BOOST_LOG(info) << "Second display: capturing "sv << source << " at "sv

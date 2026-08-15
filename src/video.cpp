@@ -2855,7 +2855,7 @@ namespace video {
    * per-context; only the reference was hard-coded.
    */
   void captureThreadSyncFor(
-    const std::shared_ptr<safe::shared_t<capture_thread_sync_ctx_t>::element_type> &ref,
+    safe::shared_t<capture_thread_sync_ctx_t>::ptr_t ref,
     const char *thread_name
   ) {
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;

@@ -1,7 +1,20 @@
 # windows specific dependencies
 
 # MinHook setup - use installed minhook for AMD64, otherwise download minhook-detours for ARM64
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
+#
+# Tested for ARM64 rather than for AMD64, and defaulting to the installed
+# MinHook. `CMAKE_SYSTEM_PROCESSOR` is empty under MSYS2/MinGW with Ninja --
+# `project()` recomputes it and finds nothing to set it from -- so an exact
+# "AMD64" match fails on a perfectly ordinary x64 host and quietly takes the
+# ARM64 branch. The failure surfaces much later, at link, as
+#
+#   minhook-detours.ARM64.Release.lib: file format not recognized
+#
+# which points at MinHook rather than at the empty variable that chose it.
+# Inverting the test means the fallback is the common case rather than the
+# exotic one, so an unknown processor links the library that matches the
+# compiler instead of one that cannot.
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
     # Make sure MinHook is installed for x86/x64
     find_library(MINHOOK_LIBRARY libMinHook.a REQUIRED)
     find_path(MINHOOK_INCLUDE_DIR MinHook.h PATH_SUFFIXES include REQUIRED)
