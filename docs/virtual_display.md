@@ -2,88 +2,101 @@
 
 The second display a client streams is normally not a monitor anyone owns. It is
 the size of the client's second panel, it should exist only while a session is
-running, and no real monitor matches it.
+running, and no physical monitor is likely to match it.
 
-## What this fork cannot do
+## Driver requirement
 
-**Sunshine cannot create a monitor, and neither can this fork.**
+Sunshine DS controls a virtual display driver; it does not install or implement
+one. Windows virtual monitors are provided by signed indirect display drivers
+(IddCx), so one of the supported drivers must already be installed:
 
-Windows has no API for it. A virtual monitor is an *indirect display driver* — a
-WDDM/IddCx kernel-mode driver — and installing one requires that it be signed.
-That is a separate product with a separate release and signing story, and no
-amount of work inside this codebase produces one.
+- [SudoVDA](https://github.com/SudoMaker/SudoVDA) is preferred. Its control
+  protocol creates a monitor at the client's exact requested width, height, and
+  refresh rate for each session.
+- [MikeTheTech Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
+  is supported as a compatibility fallback. Its available modes are configured
+  before the driver starts, so Sunshine DS can select only a mode the running
+  driver already exposes.
 
-`libdisplaydevice`, which Sunshine already uses, does not help here: it
-*configures* displays that exist (topology, resolution, HDR, which is primary). It
-has no notion of bringing one into being.
-
-So the honest description of this feature is: **this fork drives an indirect
-display driver that the user has installed.** The driver is a dependency, not a
-component.
-
-## What happens without one
-
-Nothing, loudly enough to diagnose and quietly enough not to break anything.
-
-`dual_display::supported()` reports false, and everything downstream follows from
-that one answer:
-
-- `/serverinfo` advertises `MaxVideoStreams` as 1.
-- `RTSP SETUP` for `streamid=video/1/0` is refused with 404.
-- A client that asks for a second display in its SDP anyway is told, in the log,
-  that none is available, and gets a single-display session.
-
-A client behaves exactly as it does against stock Sunshine. This is the default
-state — `dual_display_source` is empty unless somebody sets it — so upgrading to
-this fork changes nothing until it is configured.
+`libdisplaydevice`, which Sunshine already uses, configures display topology and
+modes. It cannot add a new mode to a running indirect display driver.
 
 ## Configuration
 
-One setting, `dual_display_source`, in `sunshine.conf`:
+Set `dual_display_source` in `sunshine.conf`:
 
 | Value | Meaning |
 | --- | --- |
 | *(empty)* | The feature is off. This is the default. |
-| `virtual` | Ask the indirect display driver for a monitor sized to the client's second panel. |
-| anything else | Capture the real monitor with that output name. |
+| `virtual` | Acquire a supported virtual display for the client's second panel. |
+| anything else | Capture the real monitor identified by that output name or stable device identifier. |
 
-A single setting with a reserved word rather than a boolean plus a name, because
-two settings permit the contradictory state — a named monitor with the virtual
-flag also set — that somebody would then have to define the meaning of.
+The server advertises two-stream support only when the configured source can be
+resolved. If acquisition later fails, the session continues with its primary
+stream rather than failing the whole connection.
+
+### SudoVDA lifecycle
+
+For `dual_display_source = virtual`, Sunshine DS first opens the installed
+SudoVDA interface and verifies its protocol version. It then:
+
+1. derives a stable monitor identity from the paired client;
+2. creates a monitor at the exact client-requested mode;
+3. extends the Windows desktop and resolves the new target to its GDI/DXGI
+   output name;
+4. keeps the driver's watchdog alive for the session; and
+5. removes the monitor when the second stream ends.
+
+The stable identity lets Windows remember the monitor's position between
+reconnects without accumulating a new ghost monitor for every session. An
+overlapping session cannot claim the same identity.
+
+### MikeTheTech fallback
+
+When SudoVDA is unavailable, Sunshine DS can lease a recognized MikeTheTech
+virtual output. It can use an already active output or activate a detached one
+by stable device identifier. It does not treat an arbitrary disconnected
+physical monitor as virtual.
+
+The driver reads its modes from `vdd_settings.xml` when it initializes. The
+default location is `C:\VirtualDisplayDriver\vdd_settings.xml`; a `VDDPATH`
+value under `HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver` can override that
+directory. Add every client-panel mode that must be exact before restarting the
+driver. For example, an AYN Thor lower panel entry is:
+
+```xml
+<resolution>
+    <width>1240</width>
+    <height>1080</height>
+    <refresh_rate>30</refresh_rate>
+</resolution>
+```
+
+Editing the XML alone does not update the running driver's mode table. Restart
+only the virtual display device, or reboot Windows, after changing it. The
+driver's named-pipe reload command in existing releases does not add a new
+resolution to an already initialized mode table.
+
+At session start Sunshine DS chooses an exact enumerated mode when available.
+If the driver does not expose one, it logs the nearest supported mode and the
+encoder scales or letterboxes that capture to the client dimensions. An exact
+driver mode avoids that extra conversion and preserves one-to-one desktop and
+touch geometry.
+
+For an existing virtual output, Sunshine DS records the original Windows mode.
+On teardown it restores that mode only if the output is still using the mode
+Sunshine applied; a mode changed by the user or another component is preserved.
+An automatically activated output also restores its preceding topology.
 
 ### Using a real monitor
 
-Works today, with no driver. Set `dual_display_source` to the output name of a
-monitor you are not otherwise using; the name is the same one `output_name`
-takes, and `dual_display::supported()` checks it is actually attached before
-advertising anything.
+Set `dual_display_source` to the output name or stable display identifier of an
+attached monitor. Nothing is created or removed. Capture uses that display and
+the encoder produces the dimensions requested by the client.
 
-The mode streamed is what the *client* asked for rather than the monitor's native
-mode, because the encoder scales and the alternative sends a 4K desktop to a
-panel that cannot show it.
+## Behavior without a supported source
 
-### Using a virtual display
-
-Not yet bound to a driver. `virtual_display_available()` in
-[`src/dual_display.cpp`](../src/dual_display.cpp) returns false, which switches
-the whole feature off as described above.
-
-Binding one means implementing two functions against a chosen driver:
-
-- `virtual_display_available()` — is the driver installed and responding.
-- a `lease_t` that asks it for a monitor at a given mode on construction, and
-  removes that monitor on destruction.
-
-The rest of the fork is written against `lease_t` and needs no further change:
-capture opens the leased display by name through the ordinary path and does not
-know it is virtual.
-
-Candidate drivers, all IddCx-based and permissively licensed:
-
-- [Virtual-Display-Driver](https://github.com/VirtualDisplay/Virtual-Display-Driver)
-- [IddSampleDriver](https://github.com/roshkins/IddSampleDriver)
-
-The choice matters mostly for how monitors are requested at run time — some are
-driven by a config file read at driver start, which is unusable here because the
-mode is not known until a client connects, and some expose a control channel,
-which is what this needs.
+When the feature is disabled or no configured source is available,
+`dual_display::supported()` reports false. The server then advertises one video
+stream and refuses setup of `streamid=video/1/0`. Primary streaming, audio, and
+input retain normal Sunshine behavior.

@@ -32,6 +32,7 @@
 #include "platform/common.h"
 #include "process.h"
 #include "rtsp.h"
+#include "stream.h"
 #include "system_tray.h"
 #include "utility.h"
 #include "uuid.h"
@@ -931,7 +932,10 @@ namespace nvhttp {
      * currently unable to serve a second display. That distinction is worth a
      * different message to the user.
      */
-    tree.put("root.MaxVideoStreams", dual_display::supported() ? 2 : 1);
+    tree.put(
+      "root.MaxVideoStreams",
+      dual_display::supported() && stream::second_video_port_available() ? 2 : 1
+    );
 
     if (!config::nvhttp.external_ip.empty()) {
       tree.put("root.ExternalIP", config::nvhttp.external_ip);

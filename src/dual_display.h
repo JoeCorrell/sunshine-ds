@@ -11,8 +11,8 @@
 
 // standard includes
 #include <memory>
-#include <optional>
 #include <string>
+#include <string_view>
 
 namespace dual_display {
 
@@ -23,7 +23,17 @@ namespace dual_display {
     int width;  ///< Width in pixels of the client's second panel.
     int height;  ///< Height in pixels of the client's second panel.
     int framerate;  ///< Requested frames per second for the second stream.
+    std::string_view client_id {};  ///< Stable paired-client identity used for persistent virtual-monitor topology.
   };
+
+  /**
+   * @brief Validate a requested second-display mode.
+   *
+   * @param request Mode supplied by the remote client.
+   * @return True when every dimension is positive and representable by the
+   * SudoVDA control protocol.
+   */
+  [[nodiscard]] bool valid_request(const request_t &request);
 
   /**
    * @brief A display being streamed as the second video stream.
@@ -44,15 +54,6 @@ namespace dual_display {
      */
     [[nodiscard]] virtual std::string output_name() const = 0;
 
-    /**
-     * @brief The mode actually granted.
-     *
-     * Not necessarily what was asked for. A virtual display driver may round to
-     * a mode it supports, and a physical monitor grants whatever it already is —
-     * so the encoder is configured from this rather than from the request, and
-     * the client scales.
-     */
-    [[nodiscard]] virtual request_t granted() const = 0;
   };
 
   /**

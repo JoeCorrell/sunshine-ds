@@ -73,6 +73,7 @@ namespace upnp {
     deinit_t() {
       auto rtsp = std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT));
       auto video = std::to_string(net::map_port(stream::VIDEO_STREAM_PORT));
+      auto video2 = std::to_string(net::map_port(stream::VIDEO_STREAM_2_PORT));
       auto audio = std::to_string(net::map_port(stream::AUDIO_STREAM_PORT));
       auto control = std::to_string(net::map_port(stream::CONTROL_PORT));
       auto gs_http = std::to_string(net::map_port(nvhttp::PORT_HTTP));
@@ -82,6 +83,7 @@ namespace upnp {
       mappings.assign({
         {{rtsp, rtsp, "TCP"s}, "Sunshine - RTSP"s},
         {{video, video, "UDP"s}, "Sunshine - Video"s},
+        {{video2, video2, "UDP"s}, "Sunshine - Video 2"s},
         {{audio, audio, "UDP"s}, "Sunshine - Audio"s},
         {{control, control, "UDP"s}, "Sunshine - Control"s},
         {{gs_http, gs_http, "TCP"s}, "Sunshine - Client HTTP"s},

@@ -6,6 +6,10 @@
 
 // standard includes
 #include <atomic>
+#include <cstdint>
+#include <optional>
+#include <string_view>
+#include <utility>
 
 // local includes
 #include "crypto.h"
@@ -13,6 +17,44 @@
 
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
+
+  /**
+   * @brief Parsed media selector from an RTSP SETUP target.
+   */
+  struct stream_target_t {
+    std::string_view type;  ///< Media type such as `video`, `audio`, or `control`.
+    std::uint32_t index;  ///< Video stream index or control protocol generation; legacy targets use zero.
+  };
+
+  /**
+   * @brief Parse a GameStream RTSP media target without assuming an equals sign.
+   *
+   * Both modern `streamid=video/1/0` targets and legacy unindexed `video`
+   * targets are accepted. Explicit malformed or overflowing indices are
+   * rejected instead of accidentally aliasing the primary stream.
+   *
+   * @param target Complete RTSP request target or media selector.
+   * @return Parsed media selector, or no value for a malformed target.
+   */
+  [[nodiscard]] std::optional<stream_target_t> parse_stream_target(std::string_view target);
+
+  /**
+   * @brief Fit two requested video bitrates under one host-wide ceiling.
+   *
+   * The primary request is preserved first while reserving up to one fifth of
+   * the ceiling for stream 1. Any capacity the primary does not use remains
+   * available to the secondary stream.
+   *
+   * @param primary_kbps Primary requested bitrate in Kbps.
+   * @param secondary_kbps Secondary requested bitrate in Kbps.
+   * @param ceiling_kbps Aggregate host ceiling in Kbps, or zero for unlimited.
+   * @return Primary and secondary budgets in Kbps.
+   */
+  [[nodiscard]] std::pair<int, int> budget_dual_video_bitrates(
+    int primary_kbps,
+    int secondary_kbps,
+    int ceiling_kbps
+  );
 
   /**
    * @brief RTSP launch session state shared with stream setup.
@@ -43,6 +85,15 @@ namespace rtsp_stream {
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
     std::string client_cert;  ///< PEM certificate for the paired Moonlight client.
+
+    /**
+     * @brief Reservation acquired by SETUP for the optional second video port.
+     *
+     * Type-erased to avoid exposing stream broadcaster internals through the
+     * RTSP launch-session API. It is released after ANNOUNCE transfers the
+     * broadcaster lifetime to the active stream session.
+     */
+    std::shared_ptr<void> second_video_port_reservation;
   };
 
   /**

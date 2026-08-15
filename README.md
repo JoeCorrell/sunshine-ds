@@ -22,6 +22,14 @@
   <a href="https://sonarcloud.io/project/overview?id=LizardByte_Sunshine"><img src="https://img.shields.io/sonar/quality_gate/LizardByte_Sunshine.svg?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarqubecloud&label=sonarcloud" alt="SonarCloud"></a>
 </div>
 
+## Sunshine DS quick start
+
+1. Install a Windows virtual display driver and run **Sunshine DS.exe**.
+2. Open `https://localhost:47990`, finish setup, and pair Moonlight DS with the displayed PIN.
+3. Start the Desktop stream. The PC's main display appears on the Thor's top screen and the virtual display appears on the bottom screen.
+
+In Moonlight DS, press **Start** to open settings and use **Second screen** to enable or disable dual-display streaming.
+
 ## ℹ️ About
 
 Sunshine is a self-hosted game stream host for Moonlight.

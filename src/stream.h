@@ -5,6 +5,10 @@
 #pragma once
 
 // standard includes
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string_view>
 #include <utility>
 
 // lib includes
@@ -30,6 +34,65 @@ namespace stream {
    * it unless it says it wants one. See `docs/dual_display_protocol.md`.
    */
   constexpr auto VIDEO_STREAM_2_PORT = 12;
+
+  /**
+   * @brief Type-erased lifetime token that keeps the broadcast sockets bound.
+   *
+   * RTSP negotiates UDP ports before ANNOUNCE creates a stream session. Keeping
+   * this token on the launch session closes that gap, so a successful SETUP for
+   * video stream 1 reserves its socket until the session takes ownership.
+   */
+  using port_reservation_t = std::shared_ptr<void>;
+
+  /**
+   * @brief Bind and reserve all broadcast sockets needed by video stream 1.
+   *
+   * @return A reservation while the second video socket is ready, or an empty
+   * token if the socket could not be opened or bound. Destroying the final token
+   * releases the sockets when no active stream session retains them.
+   */
+  [[nodiscard]] port_reservation_t reserve_second_video_port();
+
+  /**
+   * @brief Probe whether the optional UDP video sender is currently ready.
+   *
+   * This is a lightweight bind probe with no broadcaster or worker-thread side
+   * effects. SETUP still acquires a real lifetime reservation and verifies the
+   * sender because readiness can change after `/serverinfo`.
+   *
+   * @return True when video stream 1 can presently be reserved.
+   */
+  [[nodiscard]] bool second_video_port_available();
+
+  /**
+   * @brief Decode the video-stream index carried by an IDR control request.
+   *
+   * Stock clients send two zero bytes. Dual-display clients use the formerly
+   * reserved first byte for the stream index and retain a zero second byte.
+   * @param payload Raw IDR request payload from the control channel.
+   * @return Stream index zero or one, or no value for a malformed request.
+   */
+  [[nodiscard]] std::optional<std::uint8_t> idr_stream_index(std::string_view payload);
+
+  /**
+   * @brief Parsed reference-frame invalidation control request.
+   */
+  struct ref_frame_invalidation_t {
+    std::int64_t first_frame;  ///< First frame in the invalidated range.
+    std::int64_t last_frame;  ///< Last frame in the invalidated range.
+    std::uint8_t stream_index;  ///< Video stream receiving the invalidation.
+  };
+
+  /**
+   * @brief Decode an exact 24-byte reference-frame invalidation request.
+   *
+   * The third formerly reserved 64-bit word carries the stream index. Stock
+   * packets contain zero and therefore continue to target the primary stream.
+   *
+   * @param payload Raw control-channel payload.
+   * @return Parsed request, or no value for a malformed size or index.
+   */
+  [[nodiscard]] std::optional<ref_frame_invalidation_t> parse_ref_frame_invalidation(std::string_view payload);
 
   struct session_t;
 

@@ -12,7 +12,9 @@ extern "C" {
 // standard includes
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <format>
+#include <limits>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -41,6 +43,72 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace rtsp_stream {
+  std::optional<stream_target_t> parse_stream_target(std::string_view target) {
+    constexpr auto marker = "streamid="sv;
+    const auto marker_pos = target.find(marker);
+    if (marker_pos != std::string_view::npos) {
+      if (marker_pos != 0 && target[marker_pos - 1] != '/') {
+        return std::nullopt;
+      }
+      target.remove_prefix(marker_pos + marker.size());
+    } else {
+      const auto query_pos = target.find_first_of("? \t\r\n"sv);
+      target = target.substr(0, query_pos);
+      if (target != "video"sv && target != "audio"sv && target != "control"sv) {
+        return std::nullopt;
+      }
+    }
+
+    const auto target_end = target.find_first_of("? \t\r\n"sv);
+    target = target.substr(0, target_end);
+    const auto slash = target.find('/');
+    const auto type = target.substr(0, slash);
+    if (type.empty()) {
+      return std::nullopt;
+    }
+
+    std::uint32_t index = 0;
+    if (slash != std::string_view::npos) {
+      const auto index_end = target.find('/', slash + 1);
+      if (index_end == std::string_view::npos || target.substr(index_end + 1) != "0"sv) {
+        return std::nullopt;
+      }
+      const auto encoded_index = target.substr(slash + 1, index_end - slash - 1);
+      if (encoded_index.empty()) {
+        return std::nullopt;
+      }
+
+      const auto result = std::from_chars(encoded_index.data(), encoded_index.data() + encoded_index.size(), index);
+      if (result.ec != std::errc {} || result.ptr != encoded_index.data() + encoded_index.size()) {
+        return std::nullopt;
+      }
+    }
+
+    return stream_target_t {type, index};
+  }
+
+  std::pair<int, int> budget_dual_video_bitrates(
+    int primary_kbps,
+    int secondary_kbps,
+    int ceiling_kbps
+  ) {
+    if (primary_kbps <= 0 || secondary_kbps <= 0 || ceiling_kbps < 2 ||
+        static_cast<std::int64_t>(primary_kbps) + secondary_kbps <= ceiling_kbps) {
+      return {primary_kbps, secondary_kbps};
+    }
+
+    const auto reserved_secondary = std::min(secondary_kbps, std::max(1, ceiling_kbps / 5));
+    auto primary_budget = std::min(primary_kbps, ceiling_kbps - reserved_secondary);
+    auto secondary_budget = std::min(secondary_kbps, ceiling_kbps - primary_budget);
+
+    auto remaining = ceiling_kbps - primary_budget - secondary_budget;
+    const auto primary_extra = std::min(primary_kbps - primary_budget, remaining);
+    primary_budget += primary_extra;
+    remaining -= primary_extra;
+    secondary_budget += std::min(secondary_kbps - secondary_budget, remaining);
+    return {primary_budget, secondary_budget};
+  }
+
   /**
    * @brief Release msg resources.
    *
@@ -1015,36 +1083,16 @@ namespace rtsp_stream {
     auto seqn_str = std::to_string(req->sequenceNumber);
     seqn.content = const_cast<char *>(seqn_str.c_str());
 
-    std::string_view target {req->message.request.target};
-    auto begin = std::find(std::begin(target), std::end(target), '=') + 1;
-    auto end = std::find(begin, std::end(target), '/');
-    std::string_view type {begin, (size_t) std::distance(begin, end)};
-
-    /*
-     * The stream index, which the protocol has always carried and this server
-     * has always thrown away.
-     *
-     * Identifiers are `streamid=video/0/0`, and the first number is the index of
-     * the video stream being set up — the same index the SDP's `x-nv-video[N]`
-     * slots use. Every client sends 0, so discarding it was harmless until now.
-     *
-     * Absent or unparseable means 0, which keeps `streamid=video` (sent by
-     * clients older than GameStream 5) working.
-     */
-    int stream_index = 0;
-    if (end != std::end(target)) {
-      auto index_begin = end + 1;
-      auto index_end = std::find(index_begin, std::end(target), '/');
-      std::string_view index_str {index_begin, (size_t) std::distance(index_begin, index_end)};
-      if (!index_str.empty() && std::all_of(std::begin(index_str), std::end(index_str), ::isdigit)) {
-        stream_index = (int) util::from_view(index_str);
-      }
+    const auto target = parse_stream_target(req->message.request.target);
+    if (!target) {
+      cmd_not_found(sock, session, std::move(req));
+      return;
     }
 
     std::uint16_t port;
-    if (type == "audio"sv) {
+    if (target->type == "audio"sv && target->index == 0) {
       port = net::map_port(stream::AUDIO_STREAM_PORT);
-    } else if (type == "video"sv) {
+    } else if (target->type == "video"sv) {
       /*
        * A second video stream gets a port of its own, and that is what tells a
        * client its request was understood.
@@ -1062,17 +1110,29 @@ namespace rtsp_stream {
        * server has not seen the client's SDP and cannot know what this session
        * wants, only what it is capable of.
        */
-      if (stream_index == 1) {
+      if (target->index == 1) {
         if (!dual_display::supported()) {
           BOOST_LOG(warning) << "SETUP for video/1 but no second display is available"sv;
           cmd_not_found(sock, session, std::move(req));
           return;
         }
+        if (!session.second_video_port_reservation) {
+          session.second_video_port_reservation = stream::reserve_second_video_port();
+        }
+        if (!session.second_video_port_reservation) {
+          BOOST_LOG(warning) << "SETUP for video/1 failed because its UDP port could not be reserved"sv;
+          cmd_not_found(sock, session, std::move(req));
+          return;
+        }
         port = net::map_port(stream::VIDEO_STREAM_2_PORT);
-      } else {
+      } else if (target->index == 0) {
         port = net::map_port(stream::VIDEO_STREAM_PORT);
+      } else {
+        cmd_not_found(sock, session, std::move(req));
+        return;
       }
-    } else if (type == "control"sv) {
+    } else if (target->type == "control"sv &&
+               (target->index == 0 || target->index == 1 || target->index == 13)) {
       port = net::map_port(stream::CONTROL_PORT);
     } else {
       cmd_not_found(sock, session, std::move(req));
@@ -1095,7 +1155,7 @@ namespace rtsp_stream {
 
     // Send identifiers that will be echoed in the other connections
     auto connect_data = std::to_string(session.control_connect_data);
-    if (type == "control"sv) {
+    if (target->type == "control"sv) {
       payload_option.option = const_cast<char *>("X-SS-Connect-Data");
       payload_option.content = connect_data.data();
     } else {
@@ -1117,6 +1177,10 @@ namespace rtsp_stream {
    * @param req Parsed RTSP request being handled.
    */
   void cmd_announce(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+    auto release_port_reservation = util::fail_guard([&session]() {
+      session.second_video_port_reservation.reset();
+    });
+
     OPTION_ITEM option {};
 
     // I know these string literals will not be modified
@@ -1129,23 +1193,19 @@ namespace rtsp_stream {
 
     std::vector<std::string_view> lines;
 
-    auto whitespace = [](char ch) {
-      return ch == '\n' || ch == '\r';
-    };
-
-    {
-      auto pos = std::begin(payload);
-      auto begin = pos;
-      while (pos != std::end(payload)) {
-        if (whitespace(*pos++)) {
-          lines.emplace_back(begin, pos - begin - 1);
-
-          while (pos != std::end(payload) && whitespace(*pos)) {
-            ++pos;
-          }
-          begin = pos;
-        }
+    for (std::size_t begin = 0; begin < payload.size();) {
+      const auto newline = payload.find('\n', begin);
+      auto line = payload.substr(begin, newline == std::string_view::npos ? payload.size() - begin : newline - begin);
+      if (!line.empty() && line.back() == '\r') {
+        line.remove_suffix(1);
       }
+      if (!line.empty()) {
+        lines.emplace_back(line);
+      }
+      if (newline == std::string_view::npos) {
+        break;
+      }
+      begin = newline + 1;
     }
 
     std::string_view client;
@@ -1157,12 +1217,15 @@ namespace rtsp_stream {
         client = line.substr(2);
       } else if (type == "a=") {
         auto pos = line.find(':');
+        if (pos == std::string_view::npos || pos < 2) {
+          continue;
+        }
 
         auto name = line.substr(2, pos - 2);
         auto val = line.substr(pos + 1);
 
-        if (val[val.size() - 1] == ' ') {
-          val = val.substr(0, val.size() - 1);
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) {
+          val.remove_suffix(1);
         }
         args.emplace(name, val);
       }
@@ -1194,13 +1257,20 @@ namespace rtsp_stream {
      * has to default to "no second display" for every client that has never
      * heard of one, which is all of them.
      */
-    args.try_emplace("x-ml-video[1].enable"sv, "0"sv);
-    args.try_emplace("x-nv-video[1].clientViewportWd"sv, "0"sv);
-    args.try_emplace("x-nv-video[1].clientViewportHt"sv, "0"sv);
-    args.try_emplace("x-nv-video[1].maxFPS"sv, "0"sv);
-    args.try_emplace("x-nv-video[1].initialBitrateKbps"sv, "0"sv);
+    stream::config_t config {};
 
-    stream::config_t config;
+    auto parse_int = [](std::string_view value) -> std::optional<int> {
+      int parsed = 0;
+      const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+      if (value.empty() || result.ec != std::errc {} || result.ptr != value.data() + value.size()) {
+        return std::nullopt;
+      }
+      return parsed;
+    };
+    auto optional_int = [&](std::string_view name) -> std::optional<int> {
+      const auto value = args.find(name);
+      return value == std::end(args) ? std::nullopt : parse_int(value->second);
+    };
 
     std::int64_t configuredBitrateKbps;
     config.audio.flags[audio::config_t::HOST_AUDIO] = session.host_audio;
@@ -1256,47 +1326,6 @@ namespace rtsp_stream {
           config.monitor.framerateX100 = 0;
         }
       }
-      /*
-       * The second display, when the client asked for one.
-       *
-       * `x-ml-video[1].enable` is the request, and it is required to be present
-       * and set rather than inferred from the `x-nv-video[1].*` slots beside it.
-       * Those slots have carried `transferProtocol` and `rateControlMode`
-       * boilerplate from every client for years, so their presence says nothing
-       * about intent — a host that read them as a request would start a second
-       * encoder for clients that have never heard of one.
-       *
-       * Everything else is read only once the request is established, and read
-       * defensively: a client that asks for a second display without saying how
-       * big it is gets no second display rather than a zero-sized encoder.
-       */
-      if (util::from_view(args.at("x-ml-video[1].enable"sv)) != 0) {
-        if (!dual_display::supported()) {
-          BOOST_LOG(info) << "Client requested a second display, but none is available"sv;
-        } else {
-          video::config_t monitor2 = config.monitor;
-          monitor2.width = (int) util::from_view(args.at("x-nv-video[1].clientViewportWd"sv));
-          monitor2.height = (int) util::from_view(args.at("x-nv-video[1].clientViewportHt"sv));
-          monitor2.framerate = (int) util::from_view(args.at("x-nv-video[1].maxFPS"sv));
-          monitor2.bitrate = (int) util::from_view(args.at("x-nv-video[1].initialBitrateKbps"sv));
-
-          // Copied from the first monitor and then cleared, rather than left:
-          // framerateX100 describes the *client's* panel refresh for stream 0 and
-          // means nothing here, and carrying it over would set the second
-          // encoder's cadence from the first panel's display mode.
-          monitor2.framerateX100 = 0;
-
-          if (monitor2.width <= 0 || monitor2.height <= 0 || monitor2.framerate <= 0) {
-            BOOST_LOG(warning) << "Client requested a second display without a usable mode"sv;
-          } else {
-            BOOST_LOG(info) << "Second display requested: "sv << monitor2.width << 'x'
-                            << monitor2.height << '@' << monitor2.framerate
-                            << " at "sv << monitor2.bitrate << " Kbps"sv;
-            config.monitor2 = monitor2;
-          }
-        }
-      }
-
       config.monitor.bitrate = (int) util::from_view(args.at("x-nv-vqos[0].bw.maximumBitrateKbps"sv));
       config.monitor.slicesPerFrame = (int) util::from_view(args.at("x-nv-video[0].videoEncoderSlicesPerFrame"sv));
       config.monitor.numRefFrames = (int) util::from_view(args.at("x-nv-video[0].maxNumReferenceFrames"sv));
@@ -1305,6 +1334,47 @@ namespace rtsp_stream {
       config.monitor.dynamicRange = (int) util::from_view(args.at("x-nv-video[0].dynamicRangeMode"sv));
       config.monitor.chromaSamplingType = (int) util::from_view(args.at("x-ss-video[0].chromaSamplingType"sv));
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
+
+      /*
+       * The explicit enable bit distinguishes a real request from the reserved
+       * x-nv-video[1] boilerplate emitted by stock clients. A matching SETUP
+       * reservation is also required, so SDP alone cannot create a display and
+       * encoder that no client socket will ever receive.
+       */
+      const auto second_enable_value = args.find("x-ml-video[1].enable"sv);
+      if (second_enable_value != std::end(args)) {
+        const auto second_enabled = parse_int(second_enable_value->second);
+        if (!second_enabled) {
+          BOOST_LOG(warning) << "Ignoring malformed second-display enable value"sv;
+        } else if (*second_enabled != 0) {
+        if (!session.second_video_port_reservation) {
+          BOOST_LOG(warning) << "Client enabled a second display without completing video/1 SETUP"sv;
+        } else if (!dual_display::supported()) {
+          BOOST_LOG(info) << "Client requested a second display, but none is available"sv;
+        } else {
+          const auto width = optional_int("x-nv-video[1].clientViewportWd"sv);
+          const auto height = optional_int("x-nv-video[1].clientViewportHt"sv);
+          const auto framerate = optional_int("x-nv-video[1].maxFPS"sv);
+          const auto bitrate = optional_int("x-nv-video[1].initialBitrateKbps"sv);
+
+          if (!width || !height || !framerate || !bitrate || *width <= 0 || *height <= 0 || *framerate <= 0 || *bitrate <= 0) {
+            BOOST_LOG(warning) << "Client requested a second display without a usable mode and bitrate"sv;
+          } else {
+            video::config_t monitor2 = config.monitor;
+            monitor2.width = *width;
+            monitor2.height = *height;
+            monitor2.framerate = *framerate;
+            monitor2.framerateX100 = 0;
+            monitor2.bitrate = *bitrate;
+
+            BOOST_LOG(info) << "Second display requested: "sv << monitor2.width << 'x'
+                            << monitor2.height << '@' << monitor2.framerate
+                            << " at "sv << monitor2.bitrate << " Kbps"sv;
+            config.monitor2 = monitor2;
+          }
+        }
+        }
+      }
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
     } catch (std::out_of_range &) {
@@ -1375,6 +1445,21 @@ namespace rtsp_stream {
 
       BOOST_LOG(debug) << "Final adjusted video encoding bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
       config.monitor.bitrate = (int) configuredBitrateKbps;
+    }
+
+    if (config.monitor2 && config::video.max_bitrate > 0) {
+      const auto [primary_budget, secondary_budget] = budget_dual_video_bitrates(
+        config.monitor.bitrate,
+        config.monitor2->bitrate,
+        config::video.max_bitrate
+      );
+      if (primary_budget != config.monitor.bitrate || secondary_budget != config.monitor2->bitrate) {
+        BOOST_LOG(info) << "Dual-display bitrate budget: primary "sv << primary_budget
+                        << " Kbps, secondary "sv << secondary_budget
+                        << " Kbps, aggregate ceiling "sv << config::video.max_bitrate << " Kbps"sv;
+      }
+      config.monitor.bitrate = primary_budget;
+      config.monitor2->bitrate = secondary_budget;
     }
 
     if (config.monitor.videoFormat == 1 && video::active_hevc_mode == 1) {

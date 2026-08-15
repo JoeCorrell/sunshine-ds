@@ -606,14 +606,18 @@ namespace video {
   struct sync_session_ctx_t {
     safe::signal_t *join_event;  ///< Signal raised when the capture and encode workers should join.
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
+    safe::mail_raw_t::event_t<bool> stream_shutdown_event;  ///< Optional event that stops only this encoder context.
     safe::mail_raw_t::queue_t<packet_t> packets;  ///< Queue receiving encoded video packets for the stream sender.
     safe::mail_raw_t::event_t<bool> idr_events;  ///< Event raised when an IDR frame is requested.
+    safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying a reference-frame range to invalidate.
     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;  ///< Event carrying updated HDR metadata.
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;  ///< Event carrying updated touch viewport metadata.
 
     config_t config;  ///< Stream or encoder configuration captured for the worker.
     int frame_nr;  ///< Next capture-frame number assigned to encoded packets.
     void *channel_data;  ///< Platform-specific channel data forwarded to packet senders.
+    bool propagate_failure;  ///< Whether an encoder failure should stop the whole GameStream session.
+    bool stop_requested {};  ///< Whether only this encode context should stop after an isolated failure.
 
     /**
      * @brief Pins this session to one display, by output name.
@@ -626,11 +630,23 @@ namespace video {
      * game is on, and honouring them here would move the desktop stream onto the
      * game's display and send the same picture twice.
      *
-     * Last in the struct so the existing aggregate initialisers, which list nine
-     * members, keep compiling and get an empty override.
+     * Empty for primary-stream contexts.
      */
     std::string output_name_override;
   };
+
+  /**
+   * @brief Stop a synchronized encoder context according to its failure policy.
+   *
+   * @param ctx Encoder context that encountered an unrecoverable failure.
+   */
+  void stop_sync_session(sync_session_ctx_t &ctx) {
+    if (ctx.propagate_failure) {
+      ctx.shutdown_event->raise(true);
+    } else {
+      ctx.stop_requested = true;
+    }
+  }
 
   /**
    * @brief Synchronization state for one encode session.
@@ -706,30 +722,6 @@ namespace video {
   // Keep a reference counter to ensure the capture thread only runs when other threads have a reference to the capture thread
   auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);  ///< Capture thread async.
   auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);  ///< Capture thread sync.
-
-  /**
-   * @brief Start the second display's capture thread.
-   */
-  int start_capture_sync2(capture_thread_sync_ctx_t &ctx);
-
-  /**
-   * @brief Stop the second display's capture thread.
-   */
-  void end_capture_sync2(capture_thread_sync_ctx_t &ctx);
-
-  /**
-   * @brief Capture thread for the second display.
-   *
-   * A second instance rather than a second session on the existing one, because
-   * that thread opens *one* display and shares it between every session queued
-   * on it — which is exactly right for several clients watching the same screen
-   * and exactly wrong here, where the whole point is a different screen.
-   *
-   * Reference counted like the first, so it exists only while a session is
-   * actually using a second display and costs nothing for the sessions that are
-   * not.
-   */
-  auto capture_thread_sync2 = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync2, end_capture_sync2);
 
 #ifdef _WIN32
   /**
@@ -2703,10 +2695,29 @@ namespace video {
      * streams — so this session resolves its display once, from its own override,
      * and ignores both.
      */
-    const auto &pinned_output = synced_session_ctxs.front()->output_name_override;
+    const auto pinned_output = synced_session_ctxs.front()->output_name_override;
+    const auto pinned_open_deadline = std::chrono::steady_clock::now() + 5s;
 
     while (encode_session_ctx_queue.running()) {
+      for (auto pos = std::begin(synced_session_ctxs); pos != std::end(synced_session_ctxs);) {
+        if ((*pos)->shutdown_event->peek() ||
+            ((*pos)->stream_shutdown_event && (*pos)->stream_shutdown_event->peek()) ||
+            (*pos)->stop_requested) {
+          (*pos)->join_event->raise(true);
+          pos = synced_session_ctxs.erase(pos);
+        } else {
+          ++pos;
+        }
+      }
+      if (synced_session_ctxs.empty()) {
+        return encode_e::ok;
+      }
+
       if (!pinned_output.empty()) {
+        if (std::chrono::steady_clock::now() >= pinned_open_deadline) {
+          BOOST_LOG(error) << "Timed out reopening pinned second display ["sv << pinned_output << ']';
+          return encode_e::error;
+        }
         // reset_display() will sleep between retries
         reset_display(disp, encoder.platform_formats->dev_type, pinned_output, synced_session_ctxs.front()->config);
         if (disp) {
@@ -2771,7 +2782,9 @@ namespace video {
 
         KITTY_WHILE_LOOP(auto pos = std::begin(synced_sessions), pos != std::end(synced_sessions), {
           auto ctx = pos->ctx;
-          if (ctx->shutdown_event->peek()) {
+          if (ctx->shutdown_event->peek() ||
+              (ctx->stream_shutdown_event && ctx->stream_shutdown_event->peek()) ||
+              ctx->stop_requested) {
             // Let waiting thread know it can delete shutdown_event
             ctx->join_event->raise(true);
 
@@ -2792,9 +2805,15 @@ namespace video {
             ctx->idr_events->pop();
           }
 
+          while (ctx->invalidate_ref_frames_events->peek()) {
+            if (auto frames = ctx->invalidate_ref_frames_events->pop(0ms)) {
+              pos->session->invalidate_ref_frames(frames->first, frames->second);
+            }
+          }
+
           if (frame_captured && pos->session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
-            ctx->shutdown_event->raise(true);
+            stop_sync_session(*ctx);
 
             continue;
           }
@@ -2806,7 +2825,7 @@ namespace video {
 
           if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
-            ctx->shutdown_event->raise(true);
+            stop_sync_session(*ctx);
 
             continue;
           }
@@ -2845,32 +2864,33 @@ namespace video {
   }
 
   /**
-   * @brief Run synchronous capture and encode work on the capture thread.
-   */
-  /**
    * @brief The capture and encode loop, for one display.
    *
    * Takes its context rather than reaching for the singleton, so the same loop
    * serves the game's display and the second one. Everything below was already
    * per-context; only the reference was hard-coded.
+   *
+   * @param ref Capture-thread state and pending encoder contexts.
+   * @param thread_name Diagnostic name assigned to the capture thread.
    */
-  void captureThreadSyncFor(
-    safe::shared_t<capture_thread_sync_ctx_t>::ptr_t ref,
-    const char *thread_name
-  ) {
+  void captureThreadSyncFor(capture_thread_sync_ctx_t &ref, const char *thread_name) {
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
 
-    auto &ctx = ref->encode_session_ctx_queue;
+    auto &ctx = ref.encode_session_ctx_queue;
     auto lg = util::fail_guard([&]() {
       ctx.stop();
 
       for (auto &ctx : synced_session_ctxs) {
-        ctx->shutdown_event->raise(true);
+        if (ctx->propagate_failure) {
+          ctx->shutdown_event->raise(true);
+        }
         ctx->join_event->raise(true);
       }
 
       for (auto &ctx : ctx.unsafe()) {
-        ctx.shutdown_event->raise(true);
+        if (ctx.propagate_failure) {
+          ctx.shutdown_event->raise(true);
+        }
         ctx.join_event->raise(true);
       }
     });
@@ -2885,12 +2905,10 @@ namespace video {
   }
 
   void captureThreadSync() {
-    captureThreadSyncFor(capture_thread_sync.ref(), "video::capture_sync");
-  }
-
-  /** The same loop, on the second display's own context and its own display. */
-  void captureThreadSync2() {
-    captureThreadSyncFor(capture_thread_sync2.ref(), "video::capture_sync2");
+    auto ref = capture_thread_sync.ref();
+    if (ref) {
+      captureThreadSyncFor(*ref.get(), "video::capture_sync");
+    }
   }
 
   /**
@@ -3005,15 +3023,18 @@ namespace video {
       safe::signal_t join_event;
       auto ref = capture_thread_sync.ref();
       ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
-        &join_event,
-        mail->event<bool>(mail::shutdown),
-        mail::man->queue<packet_t>(mail::video_packets),
-        std::move(idr_events),
-        mail->event<hdr_info_t>(mail::hdr),
-        mail->event<input::touch_port_t>(mail::touch_port),
-        config,
-        1,
-        channel_data,
+        .join_event = &join_event,
+        .shutdown_event = mail->event<bool>(mail::shutdown),
+        .stream_shutdown_event = {},
+        .packets = mail::man->queue<packet_t>(mail::video_packets),
+        .idr_events = std::move(idr_events),
+        .invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames),
+        .hdr_events = mail->event<hdr_info_t>(mail::hdr),
+        .touch_port_events = mail->event<input::touch_port_t>(mail::touch_port),
+        .config = config,
+        .frame_nr = 1,
+        .channel_data = channel_data,
+        .propagate_failure = true,
       });
 
       // Wait for join signal
@@ -3027,7 +3048,7 @@ namespace video {
     void *channel_data,
     const std::string &output_name
   ) {
-    auto idr_events = mail->event<bool>(mail::idr);
+    auto idr_events = mail->event<bool>(mail::idr2);
     idr_events->raise(true);
 
     /*
@@ -3044,23 +3065,30 @@ namespace video {
      * throughput advantage on a stream that is usually a static desktop.
      */
     safe::signal_t join_event;
-    auto ref = capture_thread_sync2.ref();
-    ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
-      &join_event,
-      mail->event<bool>(mail::shutdown),
+    capture_thread_sync_ctx_t capture_context;
+    std::jthread capture_thread {[&capture_context]() {
+      captureThreadSyncFor(capture_context, "video::capture_sync2");
+    }};
+    capture_context.encode_session_ctx_queue.raise(sync_session_ctx_t {
+      .join_event = &join_event,
+      .shutdown_event = mail->event<bool>(mail::shutdown),
+      .stream_shutdown_event = mail->event<bool>(mail::video2_shutdown),
       // The second display's own queue. `stream.cpp` runs a sender thread
       // draining exactly this one.
-      mail::man->queue<packet_t>(mail::video_packets2),
-      std::move(idr_events),
-      mail->event<hdr_info_t>(mail::hdr),
-      mail->event<input::touch_port_t>(mail::touch_port),
-      config,
-      1,
-      channel_data,
-      output_name,
+      .packets = mail::man->queue<packet_t>(mail::video_packets2),
+      .idr_events = std::move(idr_events),
+      .invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames2),
+      .hdr_events = mail->event<hdr_info_t>(mail::hdr2),
+      .touch_port_events = mail->event<input::touch_port_t>(mail::touch_port2),
+      .config = config,
+      .frame_nr = 1,
+      .channel_data = channel_data,
+      .propagate_failure = false,
+      .output_name_override = output_name,
     });
 
     join_event.view();
+    capture_context.encode_session_ctx_queue.stop();
   }
 
   /**
@@ -3756,14 +3784,6 @@ namespace video {
    * @brief Stop capture sync processing.
    */
   void end_capture_sync(capture_thread_sync_ctx_t &ctx) {
-  }
-
-  int start_capture_sync2(capture_thread_sync_ctx_t &ctx) {
-    std::jthread {&captureThreadSync2}.detach();
-    return 0;
-  }
-
-  void end_capture_sync2(capture_thread_sync_ctx_t &ctx) {
   }
 
   /**

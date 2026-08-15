@@ -65,10 +65,16 @@ namespace mail {
 
   // Local mail
   MAIL(touch_port);  ///< Touch port.
+  MAIL(touch_port2);  ///< Touch viewport for the second display.
   MAIL(idr);  ///< IDR.
+  MAIL(idr2);  ///< IDR request for the second display.
   MAIL(invalidate_ref_frames);  ///< Invalidate ref frames.
+  MAIL(invalidate_ref_frames2);  ///< Reference-frame invalidation for the second display.
   MAIL(gamepad_feedback);  ///< Gamepad feedback.
   MAIL(hdr);  ///< HDR.
+  MAIL(hdr2);  ///< HDR state for the second display; kept separate from the primary control notification.
+  MAIL(video2_shutdown);  ///< Stops only the optional second capture and encoder pipeline.
+  MAIL(video2_termination);  ///< Failure reason sent when only the second video stream ends.
 #undef MAIL
 
 }  // namespace mail
